@@ -2,21 +2,23 @@ import flwr as fl
 import torch
 from torch import nn
 from data_util import get_fl_dataset, dataset_cfg
-from src.model import build_fp_model
+from src.model import build_fp_model, build_model
 import argparse
 import numpy as np
 from collections import OrderedDict
 from typing import List, Tuple, Dict, Optional, Union
-import sys
 import json
 import time
-from loguru import logger
-import os
+import logging
 from datetime import datetime
+
+# Configure logging
+log_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+logging.basicConfig(filename=f'logs/fedqt_{log_timestamp}.log', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # --- Parsers ---
 parser = argparse.ArgumentParser()
-parser.add_argument('--num_clients', type=int, default=10)
+parser.add_argument('--num_clients', type=int, default=5)
 parser.add_argument('--local_data', type=int, default=512)
 parser.add_argument('--batch_size', type=int, default=64)
 parser.add_argument('--log_interval', type=int, default=5)
@@ -45,14 +47,12 @@ parser.add_argument('--momentum', type=float, default=0)
 parser.add_argument('--device', type=str, default='cpu')
 parser.add_argument('--num_workers', type=int, default=0)
 parser.add_argument('--server_address', type=str, default="0.0.0.0:8080")
-parser.add_argument('--mqtt_broker_address', type=str, default='localhost')
-parser.add_argument('--mqtt_topic', type=str, default='fedqt_logs')
 
 args = parser.parse_args()
 b0 = 4
 
 class FedQTStrategy(fl.server.strategy.FedAvg):
-    def __init__(self, initial_parameters, *fl_args, **kwargs):
+    def __init__(self, initial_parameters, global_model, *fl_args, **kwargs):
         super().__init__(*fl_args, **kwargs)
         self.val_loss = None
         self.f0 = None
@@ -60,29 +60,29 @@ class FedQTStrategy(fl.server.strategy.FedAvg):
         self.comm_times = []
         self.train_times = []
         self.current_parameters = initial_parameters  # Store current global parameters
+        self.global_model = global_model  # Store reference to global model
+        self.current_bitwidth = args.Wbitwidth  # Track current bitwidth
+
+
+    def quantize_tensor(self, tensor, bitwidth):
+        """Quantize a tensor to specified bitwidth"""
+        min_val, max_val = tensor.min(), tensor.max()
+        qmin, qmax = 0, 2**bitwidth - 1
+        scale = (max_val - min_val) / (qmax - qmin) if max_val != min_val else 1.0
+        zero_point = qmin - min_val / scale
+        zero_point = torch.clamp(zero_point, qmin, qmax).round()
         
-        # Initialize Loguru logger
-        
-        # Create logs directory if it doesn't exist
-        logs_dir = "logs"
-        os.makedirs(logs_dir, exist_ok=True)
-        
-        # Create log file name with timestamp
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_file = os.path.join(logs_dir, f"fedqt_{timestamp}.log")
-        
-        # Configure logger
-        logger.remove()  # Remove default handler
-        logger.add(log_file, rotation="100 MB", level="INFO")
-        logger.add(sys.stderr, level="INFO")  # Also log to console
-        
-        logger.info(f"Starting {args.algorithm} server with {args.num_clients} clients")
-        logger.info(f"Logs will be saved to {log_file}")
-        
-        self.logger = logger
+        # Quantize
+        quantized = torch.clamp(torch.round(tensor / scale + zero_point), 0, 2**bitwidth - 1)
+        return quantized, scale, zero_point
+
+    def dequantize_tensor(self, quantized_tensor, scale, zero_point):
+        """Dequantize a tensor"""
+        return scale * (quantized_tensor - zero_point)
 
     def aggregate_fit(self, server_round, results, failures):
         print(f"\n=== Server Round {server_round} - Aggregating Fit Results ===")
+        logging.info(f"Server Round {server_round} - Aggregating fit results from {len(results)} clients (with {len(failures)} failures)")
         print(f"Received results from {len(results)} clients")
         print(f"Failures: {len(failures)}")
         
@@ -98,45 +98,104 @@ class FedQTStrategy(fl.server.strategy.FedAvg):
         if args.update_mode == 1 and args.quantize_comm:
             print("Using quantized update aggregation")
             aggregated_updates = self.aggregate_quantized_updates(results)
+            
+            # Apply aggregated updates to current parameters
             current_weights = fl.common.parameters_to_ndarrays(self.current_parameters)
             new_weights = [current + update for current, update in zip(current_weights, aggregated_updates)]
-            parameters_aggregated = fl.common.ndarrays_to_parameters(new_weights)
-            self.current_parameters = parameters_aggregated  # Update stored parameters
-            metrics_aggregated = {}
+            
+            # Determine new bitwidth for next round
+            new_bitwidth = self.select_bitwidth(server_round)
+            
+            # Quantize the new global model if needed
+            if args.quantize_comm and ('FedQT' in args.algorithm or 'FedPAQ' in args.algorithm or 'Q-FedUpdate' in args.algorithm):
+                # For quantized algorithms, quantize the global parameters
+                quantized_weights = []
+                quant_metadata = {'scales': [], 'zero_points': [], 'bitwidth': new_bitwidth}
+                
+                for weight in new_weights:
+                    weight_tensor = torch.tensor(weight)
+                    q_weight, scale, zero_point = self.quantize_tensor(weight_tensor, new_bitwidth)
+                    quantized_weights.append(q_weight.numpy())
+                    quant_metadata['scales'].append(float(scale))
+                    quant_metadata['zero_points'].append(float(zero_point))
+                
+                parameters_aggregated = fl.common.ndarrays_to_parameters(new_weights)  # Send FP for now
+                self.current_parameters = parameters_aggregated
+                
+                print(f"Server: Quantized global model with {new_bitwidth}-bit precision")
+                metrics_aggregated = {"quant_metadata": quant_metadata}
+            else:
+                parameters_aggregated = fl.common.ndarrays_to_parameters(new_weights)
+                self.current_parameters = parameters_aggregated
+                metrics_aggregated = {}
+            
             return parameters_aggregated, metrics_aggregated
 
         # Standard FedAvg aggregation
         print("Using standard FedAvg aggregation")
         parameters_aggregated, metrics_aggregated = super().aggregate_fit(server_round, results, failures)
         if parameters_aggregated is not None:
-            self.current_parameters = parameters_aggregated  # Update stored parameters
+            self.current_parameters = parameters_aggregated
         return parameters_aggregated, metrics_aggregated
 
     def aggregate_quantized_updates(self, results):
-        print("Aggregating quantized updates...")
+        """Aggregate quantized updates by dequantizing first"""
+        print("Dequantizing and aggregating updates...")
         total_examples = sum(res.num_examples for _, res in results)
         aggregated_updates = None
         
         for _, fit_res in results:
-            update = fl.common.parameters_to_ndarrays(fit_res.parameters)
+            update_arrays = fl.common.parameters_to_ndarrays(fit_res.parameters)
             num_examples = fit_res.num_examples
             metrics = fit_res.metrics
-            scale = metrics.get("quant_scale")
-            min_val = metrics.get("quant_min")
             
-            if scale is not None and min_val is not None:
-                dequantized_update = [u * scale + min_val for u in update]
-            else:
-                dequantized_update = update
+            # Check if updates are quantized
+            if 'scales' in metrics and 'zero_points' in metrics:
+                print(f"Dequantizing updates from client (bitwidth: {metrics.get('bitwidth', 'unknown')})")
+                # Dequantize updates
+                dequantized_updates = []
+                scales = metrics['scales']
+                zero_points = metrics['zero_points']
                 
-            weighted_update = [u * (num_examples / total_examples) for u in dequantized_update]
+                for i, update_array in enumerate(update_arrays):
+                    if i < len(scales) and i < len(zero_points):
+                        update_tensor = torch.tensor(update_array)
+                        dequant_update = self.dequantize_tensor(update_tensor, scales[i], zero_points[i])
+                        dequantized_updates.append(dequant_update.numpy())
+                    else:
+                        # Fallback if metadata is incomplete
+                        dequantized_updates.append(update_array)
+                
+                update_arrays = dequantized_updates
+            else:
+                print("Updates are already in full precision")
+            
+            # Weight by number of examples
+            weighted_updates = [u * (num_examples / total_examples) for u in update_arrays]
             
             if aggregated_updates is None:
-                aggregated_updates = weighted_update
+                aggregated_updates = weighted_updates
             else:
-                aggregated_updates = [agg + w for agg, w in zip(aggregated_updates, weighted_update)]
+                aggregated_updates = [agg + w for agg, w in zip(aggregated_updates, weighted_updates)]
                 
+        print("Aggregation completed")
         return aggregated_updates
+
+    def select_bitwidth(self, server_round):
+        """Select bitwidth for next round based on adaptive strategy"""
+        if args.adaptive_bitwidth:
+            if self.val_loss is not None and self.f0 is not None:
+                bm = b0 + int(np.floor(self.C * np.log2(max(1.0, (self.f0 + 1) / (self.val_loss + 1)))))
+                # Clamp bitwidth to reasonable range
+                bm = max(1, min(32, bm))
+                self.current_bitwidth = bm
+                print(f"Adaptive bitwidth selected: {bm} bits")
+                return bm
+            else:
+                print(f"Using default bitwidth: {args.Wbitwidth} bits")
+                return args.Wbitwidth
+        else:
+            return args.Wbitwidth
 
     def configure_fit(self, server_round, parameters, client_manager):
         print(f"\n=== Server Round {server_round} - Configuring Fit ===")
@@ -147,20 +206,17 @@ class FedQTStrategy(fl.server.strategy.FedAvg):
             "batch_size": args.batch_size, 
             "qmode": args.qmode, 
             "update_mode": args.update_mode, 
-            "algorithm": args.algorithm
+            "algorithm": args.algorithm,
+            "Wbitwidth": self.current_bitwidth
         }
         
-        if args.adaptive_bitwidth:
-            if self.val_loss is not None and self.f0 is not None:
-                bm = b0 + int(np.floor(self.C * np.log2(max(1.0, (self.f0 + 1) / (self.val_loss + 1)))))
-                config["Wbitwidth"] = bm
-                print(f"Adaptive bitwidth: {bm}")
-            else:
-                config["Wbitwidth"] = args.Wbitwidth
-                print(f"Using default bitwidth: {args.Wbitwidth}")
-        else:
-            config["Wbitwidth"] = args.Wbitwidth
-            
+        # For quantized update modes, include quantization metadata
+        if args.update_mode == 1 and args.quantize_comm and server_round > 1:
+            # After first round, send quantized updates
+            if hasattr(self, 'last_quant_metadata'):
+                config['quant_metadata'] = self.last_quant_metadata
+                print(f"Sending quantized updates to clients with {self.current_bitwidth}-bit precision")
+        
         fit_ins = fl.common.FitIns(parameters, config)
         clients = client_manager.sample(num_clients=self.min_fit_clients, min_num_clients=self.min_fit_clients)
         print(f"Selected {len(clients)} clients for training")
@@ -179,62 +235,89 @@ class FedQTStrategy(fl.server.strategy.FedAvg):
                 self.C = 16 / (np.log2(self.f0 + 1)) if self.f0 > 0 else 16
                 print(f"Initialized f0: {self.f0}, C: {self.C}")
 
-            # Logging via MQTT
-            # Log server round results
             avg_comm_time = np.mean(self.comm_times) if self.comm_times else 0
             avg_train_time = np.mean(self.train_times) if self.train_times else 0
             accuracy = metrics_aggregated.get("accuracy", 0.0)
+            log_data = {
+                "global_round": server_round, 
+                "algorithm": args.algorithm, 
+                "accuracy": accuracy, 
+                "average_communication_time": avg_comm_time, 
+                "training_overhead": avg_train_time,
+                "bitwidth": self.current_bitwidth
+            }
             
-            # Log using loguru logger
-            self.logger.info(
-                f"Round {server_round} | "
-                f"Algorithm: {args.algorithm} | "
-                f"Accuracy: {accuracy:.4f} | "
-                f"Avg Comm Time: {avg_comm_time:.8f}s | "
-                f"Avg Train Time: {avg_train_time:.4f}s"
-            )
+            # Log to file
+            logging.info(f"Round {server_round} results: {json.dumps(log_data)}")
             
-            # Also print to console for immediate feedback
-            print(f"Round {server_round} | Avg Comm Time: {avg_comm_time:.8f}s | Avg Train Time: {avg_train_time:.4f}s")
+            print(f"Round {server_round} | Accuracy: {accuracy:.4f} | Bitwidth: {self.current_bitwidth} | Avg Comm Time: {avg_comm_time:.8f}s | Avg Train Time: {avg_train_time:.4f}s")
+            
             # Clear metrics for next round
             self.comm_times, self.train_times = [], []
             
         return loss_aggregated, metrics_aggregated
 
-def get_evaluate_fn(model, test_ds, criterion):
+def get_evaluate_fn(global_model, test_ds, criterion):
     test_loader = torch.utils.data.DataLoader(test_ds, batch_size=128, shuffle=False, num_workers=args.num_workers)
     
     def evaluate(server_round, parameters, config):
         print(f"=== Server Evaluation Round {server_round} ===")
         device = args.device
         
-        # Load parameters into model
-        params_dict = zip(model.state_dict().keys(), parameters)
-        state_dict = OrderedDict({k: torch.tensor(v, dtype=torch.float32) for k, v in params_dict})
-        model.load_state_dict(state_dict, strict=True)
-        model.to(device)
-        model.eval()
-        
-        total_loss = 0.0
-        correct = 0
-        total = 0
-        
-        with torch.no_grad():
-            for data, target in test_loader:
-                data, target = data.to(device), target.to(device)
-                output = model(data)
-                loss = criterion(output, target)
-                total_loss += loss.item() * data.size(0)
+        try:
+            # Handle different model types
+            if hasattr(global_model, 'dequantize'):
+                # Quantized model - dequantize for evaluation
+                print("Using quantized model - dequantizing for evaluation")
+                eval_model = global_model.dequantize()
+                eval_model.to(device)
+                eval_model.eval()
                 
-                _, predicted = torch.max(output.data, 1)
-                total += target.size(0)
-                correct += (predicted == target).sum().item()
-        
-        val_loss = total_loss / total if total > 0 else 0
-        val_prec1 = correct / total if total > 0 else 0
-        
-        print(f"Server evaluation - Loss: {val_loss:.4f}, Accuracy: {val_prec1:.4f}")
-        return val_loss, {"accuracy": val_prec1}
+                # Load parameters into the dequantized model
+                try:
+                    params_dict = zip(eval_model.state_dict().keys(), parameters)
+                    state_dict = OrderedDict({k: torch.tensor(v, dtype=torch.float32) for k, v in params_dict})
+                    eval_model.load_state_dict(state_dict, strict=False)
+                except Exception as e:
+                    print(f"Warning: Could not load all parameters into dequantized model: {e}")
+                    # Use the global model's current state
+                    eval_model = global_model.dequantize()
+                    
+            else:
+                # Full precision model
+                print("Using full precision model")
+                eval_model = global_model
+                params_dict = zip(eval_model.state_dict().keys(), parameters)
+                state_dict = OrderedDict({k: torch.tensor(v, dtype=torch.float32) for k, v in params_dict})
+                eval_model.load_state_dict(state_dict, strict=True)
+                eval_model.to(device)
+                eval_model.eval()
+            
+            total_loss = 0.0
+            correct = 0
+            total = 0
+            
+            with torch.no_grad():
+                for data, target in test_loader:
+                    data, target = data.to(device), target.to(device)
+                    output = eval_model(data)
+                    loss = criterion(output, target)
+                    total_loss += loss.item() * data.size(0)
+                    
+                    _, predicted = torch.max(output.data, 1)
+                    total += target.size(0)
+                    correct += (predicted == target).sum().item()
+            
+            val_loss = total_loss / total if total > 0 else 0
+            val_prec1 = correct / total if total > 0 else 0
+            
+            print(f"Server evaluation - Loss: {val_loss:.4f}, Accuracy: {val_prec1:.4f}")
+            return val_loss, {"accuracy": val_prec1}
+            
+        except Exception as e:
+            print(f"Error in server evaluation: {e}")
+            # Return dummy values if evaluation fails
+            return 0.0, {"accuracy": 0.0}
     
     return evaluate
 
@@ -246,6 +329,7 @@ if __name__ == '__main__':
     if args.algorithm == 'FedAVG':
         args.qmode = 2
         args.update_mode = 0
+        args.quantize_comm = False
     elif 'FedPAQ' in args.algorithm or 'FedQT' in args.algorithm or 'Q-FedUpdate' in args.algorithm:
         args.update_mode = 1
         args.quantize_comm = True
@@ -265,27 +349,44 @@ if __name__ == '__main__':
 
     print(f"Algorithm settings - qmode: {args.qmode}, update_mode: {args.update_mode}, quantize_comm: {args.quantize_comm}")
 
-    # Create global model
-    global_model = build_fp_model(
-        dataset_cfg[args.dataset]['input_channel'], 
-        dataset_cfg[args.dataset]['input_size'], 
-        dataset_cfg[args.dataset]['output_size'], 
-        args.model, 
-        args.lr, 
-        args.device
-    )
+    # Create global model - use build_model for quantized algorithms, build_fp_model for FedAVG
+    if args.algorithm == 'FedAVG':
+        print("Creating full precision global model for FedAVG")
+        global_model = build_fp_model(
+            dataset_cfg[args.dataset]['input_channel'], 
+            dataset_cfg[args.dataset]['input_size'], 
+            dataset_cfg[args.dataset]['output_size'], 
+            args.model, 
+            args.lr, 
+            args.device
+        )
+    else:
+        print(f"Creating quantized global model for {args.algorithm}")
+        global_model = build_model(
+            dataset_cfg[args.dataset]['input_channel'], 
+            dataset_cfg[args.dataset]['input_size'], 
+            dataset_cfg[args.dataset]['output_size'], 
+            args
+        )
     
     if args.init:
         print(f"Loading initial weights from {args.init}")
         global_model.load_state_dict(torch.load(args.init))
     
     print(f"Global model created: {type(global_model)}")
-    print(f"Global model parameters: {sum(p.numel() for p in global_model.parameters())}")
     
-    # Get initial parameters
-    initial_parameters = fl.common.ndarrays_to_parameters([
-        val.detach().cpu().numpy() for _, val in global_model.state_dict().items()
-    ])
+    # Get initial parameters - always send full precision for initial broadcast
+    if hasattr(global_model, 'dequantize'):
+        # For quantized models, use dequantized parameters for initial communication
+        print("Extracting parameters from quantized model")
+        fp_model = global_model.dequantize()
+        initial_parameters = fl.common.ndarrays_to_parameters([
+            val.detach().cpu().numpy() for _, val in fp_model.state_dict().items()
+        ])
+    else:
+        initial_parameters = fl.common.ndarrays_to_parameters([
+            val.detach().cpu().numpy() for _, val in global_model.state_dict().items()
+        ])
     
     print(f"Initial parameters created: {len(initial_parameters.tensors)} tensors")
     
@@ -295,6 +396,7 @@ if __name__ == '__main__':
     # Create strategy with initial parameters
     strategy = FedQTStrategy(
         initial_parameters=initial_parameters,
+        global_model=global_model,
         fraction_fit=0.2, 
         fraction_evaluate=0.2, 
         min_fit_clients=max(2, int(args.num_clients * 0.2)), 

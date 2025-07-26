@@ -1,6 +1,6 @@
 #!/bin/bash
 
-NUM_CLIENTS=10
+NUM_CLIENTS=5
 
 CLIENT_DIR="/Users/ritvikasonawane/Documents/r24k8xbv/0S25/QFL/quba_fl"
 
