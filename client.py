@@ -245,6 +245,9 @@ class FlowerClient(fl.client.NumPyClient):
                 
                 optimizer.zero_grad()
                 output = self.model(data)
+                # Handle case where model returns tuple (output, features, etc.)
+                if isinstance(output, tuple):
+                    output = output[0]  # Take first element (logits)
                 # Ensure target is a tensor with the right type
                 target = target.long()
                 loss = self.criterion(output, target)
@@ -326,21 +329,13 @@ class FlowerClient(fl.client.NumPyClient):
         with torch.no_grad():
             for data, target in test_loader:
                 data, target = data.to(args.device), target.to(args.device)
+                target = target.long()
                 output = self.model(data)
-
-                # If output is a NumPy array:
-                if isinstance(output, np.ndarray):
-                    output = torch.from_numpy(output).float()  # or .to(torch.float32)
-
-                # If output is a list:
-                elif isinstance(output, list):
-                    output = torch.tensor(output, dtype=torch.float32)
-
-                # Same idea for target:
-                if isinstance(target, np.ndarray):
-                    target = torch.from_numpy(target).long()  # class indices must be long
-                elif isinstance(target, list):
-                    target = torch.tensor(target, dtype=torch.long)
+                
+                # Handle case where model returns tuple
+                if isinstance(output, tuple):
+                    output = output[0]  # Take first element (logits)
+                
                 loss = self.criterion(output, target)
                 total_loss += loss.item() * data.size(0)
                 
