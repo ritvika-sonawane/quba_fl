@@ -32,31 +32,23 @@ class Qnet(nn.Module):
     def forward(self, x):
         x_data, scale = self.quantizer(x)
         x = x_data, scale
-        self.out, self.out_s = self.forward_layers(x)
+        self.out, self.out_s = self.layers(x)
         return self.out, self.out_s
 
     def backward(self, target):
         # x = self.loss(self.out, self.out_s, target)
         x, s = self.loss(self.out, self.out_s, target)
         x = x, s
-        for layer in reversed(self.forward_layers):
+        for layer in reversed(self.layers):
             if isinstance(layer,torch.nn.Sequential):
                 for block in reversed(layer):
                     x=block.backward(x)
             else:
                 x=layer.backward(x)
 
-    def state_dict(self):
-        state_dict=collections.OrderedDict()
-        for idx,l in enumerate(self.forward_layers):
-            if hasattr(l,'weight'):
-                layer_prefix = 'layers.'+str(idx)+'.'
-                state_dict[layer_prefix+'weight']=l.weight
-                state_dict[layer_prefix+'weight_scale']=l.weight_scale[0]
-        return state_dict
-
+    
     def load_state_dict(self, state_dict): #load fp state_dict
-        for idx,l in enumerate(self.forward_layers):
+        for idx,l in enumerate(self.layers):
             if hasattr(l,'weight'):
                 layer_prefix = 'layers.'+str(idx)+'.'
                 l.weight = state_dict[layer_prefix+'weight']
@@ -106,7 +98,107 @@ class nn_q(Qnet):
             QLinear(ldim, out_dim, quantizer, weight_update, initialize,bias=use_bias)
         ]
         self.use_bias = use_bias
-        self.forward_layers = nn.Sequential(*layers).to(device)
+        self.layers = nn.Sequential(*layers).to(device)
+        
+        # CRITICAL FIX: Register parameters from quantized layers
+        self._register_quantized_parameters()
+
+    def _register_quantized_parameters(self):
+        """Register parameters from custom quantized layers so PyTorch can see them"""
+        for i, layer in enumerate(self.layers):
+            if hasattr(layer, 'weight') and isinstance(layer.weight, torch.Tensor):
+                # Register the weight as a parameter
+                self.register_parameter(f'layer_{i}_weight', nn.Parameter(layer.weight))
+                
+            if hasattr(layer, 'weight_scale'):
+                # Handle weight_scale which might be a list or tensor
+                if isinstance(layer.weight_scale, torch.Tensor):
+                    self.register_parameter(f'layer_{i}_weight_scale', nn.Parameter(layer.weight_scale))
+                elif isinstance(layer.weight_scale, (list, tuple)) and len(layer.weight_scale) > 0:
+                    # Convert list/tuple to tensor
+                    if isinstance(layer.weight_scale[0], (int, float)):
+                        scale_tensor = torch.tensor(layer.weight_scale, dtype=torch.float32)
+                        self.register_parameter(f'layer_{i}_weight_scale', nn.Parameter(scale_tensor))
+                    elif isinstance(layer.weight_scale[0], torch.Tensor):
+                        scale_tensor = torch.stack(layer.weight_scale)
+                        self.register_parameter(f'layer_{i}_weight_scale', nn.Parameter(scale_tensor))
+                        
+            if hasattr(layer, 'bias') and layer.bias is not None and isinstance(layer.bias, torch.Tensor):
+                self.register_parameter(f'layer_{i}_bias', nn.Parameter(layer.bias))
+    
+    def parameters(self, recurse=True):
+        """Override parameters() to ensure we return all registered parameters"""
+        # First get the standard PyTorch parameters
+        params = list(super().parameters(recurse=recurse))
+        
+        # If no parameters found, try to extract from quantized layers
+        if not params:
+            params = []
+            for layer in self.layers:
+                if hasattr(layer, 'weight') and isinstance(layer.weight, torch.Tensor):
+                    # Ensure the weight requires gradients
+                    if not layer.weight.requires_grad:
+                        layer.weight.requires_grad_(True)
+                    params.append(layer.weight)
+                if hasattr(layer, 'bias') and layer.bias is not None and isinstance(layer.bias, torch.Tensor):
+                    if not layer.bias.requires_grad:
+                        layer.bias.requires_grad_(True)
+                    params.append(layer.bias)
+        
+        return iter(params)
+    
+    def named_parameters(self, prefix='', recurse=True):
+        """Override named_parameters() to ensure we return all named parameters"""
+        # First get the standard PyTorch named parameters
+        named_params = list(super().named_parameters(prefix=prefix, recurse=recurse))
+        
+        # If no parameters found, try to extract from quantized layers
+        if not named_params:
+            named_params = []
+            for i, layer in enumerate(self.layers):
+                layer_prefix = f"{prefix}layers.{i}." if prefix else f"layers.{i}."
+                if hasattr(layer, 'weight') and isinstance(layer.weight, torch.Tensor):
+                    named_params.append((f"{layer_prefix}weight", layer.weight))
+                if hasattr(layer, 'bias') and layer.bias is not None and isinstance(layer.bias, torch.Tensor):
+                    named_params.append((f"{layer_prefix}bias", layer.bias))
+        
+        return named_params
+
+    def state_dict(self, destination=None, prefix='', keep_vars=False):
+        """Override state_dict() to properly save quantized model state"""
+        if destination is None:
+            destination = {}
+        
+        # Try the standard state_dict first
+        try:
+            state_dict = super().state_dict(destination, prefix, keep_vars)
+            if state_dict:
+                return state_dict
+        except:
+            pass
+        
+        # If that fails, manually construct state_dict from quantized layers
+        for i, layer in enumerate(self.layers):
+            layer_prefix = f"{prefix}layers.{i}."
+            if hasattr(layer, 'weight') and isinstance(layer.weight, torch.Tensor):
+                destination[f"{layer_prefix}weight"] = layer.weight if keep_vars else layer.weight.detach()
+                
+            if hasattr(layer, 'weight_scale'):
+                if isinstance(layer.weight_scale, torch.Tensor):
+                    destination[f"{layer_prefix}weight_scale"] = layer.weight_scale if keep_vars else layer.weight_scale.detach()
+                elif isinstance(layer.weight_scale, (list, tuple)):
+                    # Convert list to tensor for storage
+                    if len(layer.weight_scale) > 0 and isinstance(layer.weight_scale[0], (int, float)):
+                        scale_tensor = torch.tensor(layer.weight_scale, dtype=torch.float32)
+                        destination[f"{layer_prefix}weight_scale"] = scale_tensor
+                    elif len(layer.weight_scale) > 0 and isinstance(layer.weight_scale[0], torch.Tensor):
+                        scale_tensor = torch.stack(layer.weight_scale)
+                        destination[f"{layer_prefix}weight_scale"] = scale_tensor if keep_vars else scale_tensor.detach()
+                        
+            if hasattr(layer, 'bias') and layer.bias is not None and isinstance(layer.bias, torch.Tensor):
+                destination[f"{layer_prefix}bias"] = layer.bias if keep_vars else layer.bias.detach()
+        
+        return destination
 
     def dequantize(self):
         fp_model = nn_fp(self.channel, self.img_size, self.out_dim, self.cfg, self.device, bias=self.use_bias)
@@ -115,13 +207,16 @@ class nn_q(Qnet):
         for idx,l in enumerate(fp_model.layers):
             if hasattr(l,'weight'):
                 layer_prefix = 'layers.'+str(idx)+'.'
-                data = state_dict[layer_prefix+'weight'] * state_dict[layer_prefix+'weight_scale']
-                if l.bias:
-                    new_dict[layer_prefix+'weight']=data[:,:-1]
-                    new_dict[layer_prefix+'bias']=data[:,-1]
-                else:
-                    new_dict[layer_prefix+'weight']=data
-        fp_model.load_state_dict(new_dict)
+                if f"{layer_prefix}weight" in state_dict and f"{layer_prefix}weight_scale" in state_dict:
+                    data = state_dict[layer_prefix+'weight'] * state_dict[layer_prefix+'weight_scale']
+                    if l.bias is not None:
+                        new_dict[layer_prefix+'weight']=data[:,:-1]
+                        new_dict[layer_prefix+'bias']=data[:,-1]
+                    else:
+                        new_dict[layer_prefix+'weight']=data
+                elif f"{layer_prefix}weight" in state_dict:
+                    new_dict[layer_prefix+'weight'] = state_dict[layer_prefix+'weight']
+        fp_model.load_state_dict(new_dict, strict=False)
         return fp_model
     
 
@@ -329,37 +424,3 @@ def build_model(in_channel, img_dim, out_dim, args):
                                   args.Wbitwidth, args.batch_size, args.lr, args.device, Ab=args.Abitwidth, 
                                   Eb=args.Ebitwidth, stochastic=args.stochastic, loss=loss)
     return model
-
-# def build_model(in_channel, img_dim, out_dim, args):
-#     cfg = model_dict[args.model]
-#     if args.qmode == 2:
-#         model = nn_fp(in_channel, img_dim, out_dim, cfg, args.lr, args.momentum,args.use_bn)
-#     else:
-#         w_quant = lambda x: fp_quant(x, args.Wbitwidth - 1)
-#         if args.stochastic:
-#             e_quant = lambda x: fp_quant_stochastic(x, args.Ebitwidth - 1)
-#             a_quant = lambda x: fp_quant_stochastic(x, args.Abitwidth - 1)
-#         else:
-#             e_quant = lambda x: fp_quant(x, args.Ebitwidth - 1)
-#             a_quant = lambda x: fp_quant(x, args.Abitwidth - 1)
-
-#         loss = QCELoss(e_quant)
-#         if args.dataset == 'spectrum' or args.dataset == 'CWRU':
-#             loss = QMSELoss(e_quant)
-        
-#         if args.qmode == 0: # NITI
-#             weight_update = lambda a,b,c,d: NITI_weight_update(a,b,c,d,args.Wbitwidth - args.m, 2**(args.Wbitwidth-1)-1)
-#             a_shit = lambda a, s: shift(a,s, args.Abitwidth - 1)
-#             e_shift = lambda a, s : shift(a, s, args.Ebitwidth - 1)
-#             model = nn_q(
-#                 in_channel, img_dim, out_dim, cfg, loss, weight_update, a_shit, e_shift, 
-#                      a_quant, w_quant, args.initialization,  use_bias=args.use_bn)
-#         elif args.qmode == 1:
-#             weight_update = lambda a, b, c, d: fp_weight_update(a,b,c,d,args.Wbitwidth - 1, args.batch_size, args.lr)
-#             a_rescale = lambda a, s: a_quant(a*s[0])
-#             e_rescale = lambda a, s: e_quant(a*s[0])
-#             model = nn_q(in_channel, img_dim, out_dim, cfg, loss, weight_update, a_rescale, e_rescale, 
-#                      a_quant, w_quant, args.initialization, use_bias=args.use_bn)
-
-
-#     return model
