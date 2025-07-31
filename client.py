@@ -244,18 +244,28 @@ class FlowerClient(fl.client.NumPyClient):
                 data, target = data.to(args.device), target.to(args.device)
                 
                 optimizer.zero_grad()
+                
+                # Handle model output consistently whether it's a tuple or single tensor
                 output = self.model(data)
-                # Handle case where model returns tuple (output, features, etc.)
                 if isinstance(output, tuple):
-                    output = output[0]  # Take first element (logits)
+                    # For quantized models that return (output, scale)
+                    output_tensor = output[0]
+                    output_scale = output[1]
+                    # Apply scaling if needed
+                    if isinstance(output_scale, list) and len(output_scale) > 0:
+                        output_tensor = output_tensor * output_scale[0]
+                else:
+                    # For full precision models
+                    output_tensor = output
+                
                 # Ensure target is a tensor with the right type
                 target = target.long()
-                loss = self.criterion(output, target)
+                loss = self.criterion(output_tensor, target)
                 loss.backward()
                 optimizer.step()
                 
                 batch_losses.append(loss.item())
-                _, predicted = torch.max(output.data, 1)
+                _, predicted = torch.max(output_tensor.data, 1)
                 total += target.size(0)
                 correct += (predicted == target).sum().item()
 
@@ -329,12 +339,9 @@ class FlowerClient(fl.client.NumPyClient):
         with torch.no_grad():
             for data, target in test_loader:
                 data, target = data.to(args.device), target.to(args.device)
-                target = target.long()
                 output = self.model(data)
-                
-                # Handle case where model returns tuple
                 if isinstance(output, tuple):
-                    output = output[0]  # Take first element (logits)
+                    output = output[0]
                 
                 loss = self.criterion(output, target)
                 total_loss += loss.item() * data.size(0)
